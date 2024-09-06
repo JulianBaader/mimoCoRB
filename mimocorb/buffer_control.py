@@ -608,11 +608,23 @@ class rbTransfer:
 
     - buffer configurations (only one source and severals sinks, no observers!)
 
-    - function ufunc() must return
+    - in v2 function ufunc() must return
+
+        -  None if data to be rejected,
+        -  list mapping to the output buffers. Each element of the list can be
+            -  None if data to be rejected
+            -  True if raw data to be copied
+            -  numpy structured array to be written to output buffer
+            -  list of numpy structured arrays to be copied to output buffer: each element of the list into a slot.
+        for use of version 2 add "version=2" as a kwarg to the class constructor
+
+    - in v1 function ufunc() must return
 
         -  None if data to be rejected,
         -  int if only raw data to be copied to sink[0]
         -  list of parameterized data to be copied to sinks[]
+
+
 
     Action:
 
@@ -631,6 +643,16 @@ class rbTransfer:
         :param ufunc: user-supplied function to filter, process and store data
         :param rb_info: dictionary with names and function (read, write, observe) of ring buffers
         """
+        if "version" in rb_info:
+            self.version = rb_info["version"]
+        else:
+            self.version = 1
+
+        if self.version == 1:
+            self.__call__ = self.__call_v1
+        if self.version == 2:
+            self.__call__ = self.__call_v2
+            self.number_of_output_buffers = len(sink_list)
 
         if not callable(ufunc):
             self.logger.error("User-supplied function is not callable!")
@@ -656,7 +678,7 @@ class rbTransfer:
         if self.reader is None or self.writers is None:
             ValueError("ERROR! Faulty ring buffer configuration!!")
 
-    def __call__(self):
+    def __call__v1(self):
         # process_data
         while self.reader._active.is_set():
             # Get new data from buffer ...
@@ -706,6 +728,59 @@ class rbTransfer:
                         self.writers[idx_out].set_metadata(*self.reader.get_metadata())
                         self.writers[idx_out].process_buffer()
                     idx_out += 1
+
+    def __call_v2(self):
+        # process_data
+        while self.reader._active.is_set():
+            # Get new data from buffer ...
+            input_data = self.reader.get()
+
+            #  ... and process data with user-provided filter function
+            filter_data = self.filter(input_data)
+            # expected return values:
+            #   None to discard data or
+            #   List mapping to the output buffers. Each element of the list can be
+            #       None: data to be rejected
+            #       True: raw data to be copied
+            #       numpy structured array: data to be written to output buffer
+            #       list of numpy structured arrays: data to be copied to output buffer: each element of the list into a slot.
+
+            if filter_data is None:
+                #  data rejected by filter
+                continue
+
+            if len(filter_data) != self.number_of_output_buffers:
+                ValueError("ERROR! Number of output buffers does not match number of filter return values!!")
+
+            for i in range(self.number_of_output_buffers):
+                if filter_data[i] is None:
+                    #  data rejected by filter
+                    continue
+                if filter_data[i] is True:
+                    #  raw data to be copied
+                    buf = self.writers[i].get_new_buffer()
+                    for ch in input_data.dtype.names:
+                        buf[ch] = input_data[ch]
+                    self.writers[i].set_metadata(*self.reader.get_metadata())
+                    self.writers[i].process_buffer()
+                elif isinstance(filter_data[i], (list, tuple)):
+                    #  data to be copied to output buffer: each element of the list into a slot
+                    for d in filter_data[i]:
+                        if d is not None:
+                            buf = self.writers[i].get_new_buffer()
+                            buf[:] = 0
+                            for ch in d.dtype.names:
+                                buf[ch] = d[ch]
+                            self.writers[i].set_metadata(*self.reader.get_metadata())
+                            self.writers[i].process_buffer()
+                else:
+                    #  data to be written to output buffer
+                    buf = self.writers[i].get_new_buffer()
+                    buf[:] = 0
+                    for ch in filter_data[i].dtype.names:
+                        buf[ch] = filter_data[i][ch]
+                    self.writers[i].set_metadata(*self.reader.get_metadata())
+                    self.writers[i].process_buffer()
 
 
 # <-- end class rbTransfer
